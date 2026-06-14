@@ -133,6 +133,11 @@ class TradeService:
             existing.realized_pnl = Decimal(str(parsed.realized_pnl)) if parsed.realized_pnl is not None else Decimal("0")
             existing.realized_pnl_net = Decimal(str(parsed.realized_pnl_net)) if parsed.realized_pnl_net is not None else Decimal("0")
 
+            # Compute qty: open qty - close qty
+            open_qty = sum(e.qty for e in parsed.open_events)
+            close_qty = sum(e.qty for e in parsed.close_events)
+            existing.qty = max(0, open_qty - close_qty)
+
             # Update cash events (delete and re-add)
             self.db.execute(
                 CashEvent.__table__.delete().where(CashEvent.trade_id == existing.id)
@@ -141,6 +146,17 @@ class TradeService:
 
             return False
         else:
+            # Get direction, strikes, option_type from first open event
+            first_open = parsed.open_events[0] if parsed.open_events else None
+            open_direction = first_open.direction.value if first_open and first_open.direction else None
+            strikes = [Decimal(str(s)) for s in first_open.strikes] if first_open and first_open.strikes else None
+            option_type = first_open.option_type.value if first_open and first_open.option_type else None
+
+            # Compute qty: open qty - close qty
+            open_qty = sum(e.qty for e in parsed.open_events)
+            close_qty = sum(e.qty for e in parsed.close_events)
+            qty = max(0, open_qty - close_qty)
+
             # Create new trade
             trade = Trade(
                 id=str(uuid4()),
@@ -149,6 +165,10 @@ class TradeService:
                 underlying=parsed.underlying,
                 strategy=parsed.strategy.value,
                 spread_label=parsed.spread_label,
+                open_direction=open_direction,
+                strikes=strikes,
+                option_type=option_type,
+                qty=qty,
                 open_time=open_time,
                 close_time=parsed.close_time,
                 expiration=parsed.expiration,
@@ -206,6 +226,275 @@ class TradeService:
         if not expiration:
             return None
         return (expiration - open_date).days
+
+    def create_trade_from_order(self, owner_key: str, parsed: dict) -> dict:
+        """
+        Create or update a trade from parsed order confirmation.
+
+        Logic:
+        - Find open trade matching underlying, expiration, strikes, option_type
+        - Same direction = scale-in (add to position)
+        - Opposite direction = close (partial or full)
+        - No match = create new trade
+
+        Args:
+            owner_key: User's data key
+            parsed: Dict from parse_order_confirmation() with:
+                direction, qty, strategy_label, underlying, expiration,
+                strikes, option_type, net_price
+
+        Returns:
+            dict with trade_id and action taken
+        """
+        from datetime import datetime
+
+        now = datetime.now()
+        direction = parsed["direction"].value
+        qty = parsed["qty"]
+        price = parsed["net_price"]
+        strikes = [Decimal(str(s)) for s in parsed["strikes"]]
+
+        # Calculate amount: BUY = debit (negative), SELL = credit (positive)
+        if direction == "BUY":
+            amount = Decimal(str(-price * qty * 100))
+        else:
+            amount = Decimal(str(price * qty * 100))
+
+        # Find matching open trade
+        matching_trade = self._find_matching_open_trade(
+            owner_key=owner_key,
+            underlying=parsed["underlying"],
+            expiration=parsed["expiration"],
+            strikes=strikes,
+            option_type=parsed["option_type"].value,
+        )
+
+        if matching_trade:
+            # Get existing open direction from first open event
+            open_events = [e for e in matching_trade.cash_events if e.event_type == "OPEN"]
+            existing_direction = open_events[0].direction if open_events else None
+            existing_qty = sum(e.qty for e in open_events)
+            close_events = [e for e in matching_trade.cash_events if e.event_type == "CLOSE"]
+            closed_qty = sum(e.qty for e in close_events)
+            open_qty = existing_qty - closed_qty
+
+            if direction == existing_direction:
+                # Same direction = scale-in
+                return self._scale_in_trade(matching_trade, parsed, amount, now, owner_key)
+            else:
+                # Opposite direction = close (partial or full)
+                return self._close_trade_partial(matching_trade, parsed, amount, now, owner_key, open_qty)
+
+        # No matching trade - create new one
+        return self._create_new_trade(parsed, amount, now, owner_key)
+
+    def _find_matching_open_trade(
+        self,
+        owner_key: str,
+        underlying: str,
+        expiration,
+        strikes: list,
+        option_type: str,
+    ) -> Optional[Trade]:
+        """Find an open trade matching the given criteria."""
+        # Get all open trades for this underlying
+        trades = self.db.execute(
+            select(Trade).where(
+                Trade.owner_key == owner_key,
+                Trade.underlying == underlying,
+                Trade.is_closed == False,
+            )
+        ).scalars().all()
+
+        for trade in trades:
+            # Check expiration
+            if trade.expiration != expiration:
+                continue
+            # Check option type
+            if trade.option_type != option_type:
+                continue
+            # Check strikes (convert to comparable format)
+            trade_strikes = set(float(s) for s in (trade.strikes or []))
+            order_strikes = set(float(s) for s in strikes)
+            if trade_strikes != order_strikes:
+                continue
+            return trade
+
+        return None
+
+    def _scale_in_trade(self, trade: Trade, parsed: dict, amount: Decimal, now, owner_key: str) -> dict:
+        """Add to an existing position (same direction)."""
+        qty = parsed["qty"]
+
+        # Add cash event
+        cash_event = CashEvent(
+            id=str(uuid4()),
+            trade_id=trade.id,
+            owner_key=owner_key,
+            ref=f"QUICK_ADD_{now.strftime('%Y%m%d%H%M%S')}",
+            event_date=now.date(),
+            event_time=now.strftime("%H:%M:%S"),
+            event_type="OPEN",
+            description=f"Scale-in: {parsed['direction'].value} {qty}x {parsed['underlying']}",
+            direction=parsed["direction"].value,
+            qty=qty,
+            strategy_label=parsed["strategy_label"],
+            expiration=parsed["expiration"],
+            strikes=[Decimal(str(s)) for s in parsed["strikes"]],
+            option_type=parsed["option_type"].value,
+            net_price=Decimal(str(parsed["net_price"])),
+            amount=amount,
+            misc_fees=Decimal("0"),
+            commissions=Decimal("0"),
+        )
+        self.db.add(cash_event)
+
+        # Update trade totals
+        trade.open_amount += amount
+        trade.qty += qty
+        self.db.commit()
+
+        return {
+            "trade_id": trade.id,
+            "action": "scale_in",
+            "message": f"Added {qty}x to existing {trade.underlying} position (now {trade.qty}x)",
+        }
+
+    def _close_trade_partial(self, trade: Trade, parsed: dict, amount: Decimal, now, owner_key: str, open_qty: int) -> dict:
+        """Close part or all of an existing position (opposite direction)."""
+        qty = parsed["qty"]
+
+        # Add cash event
+        cash_event = CashEvent(
+            id=str(uuid4()),
+            trade_id=trade.id,
+            owner_key=owner_key,
+            ref=f"QUICK_ADD_{now.strftime('%Y%m%d%H%M%S')}",
+            event_date=now.date(),
+            event_time=now.strftime("%H:%M:%S"),
+            event_type="CLOSE",
+            description=f"Close: {parsed['direction'].value} {qty}x {parsed['underlying']}",
+            direction=parsed["direction"].value,
+            qty=qty,
+            strategy_label=parsed["strategy_label"],
+            expiration=parsed["expiration"],
+            strikes=[Decimal(str(s)) for s in parsed["strikes"]],
+            option_type=parsed["option_type"].value,
+            net_price=Decimal(str(parsed["net_price"])),
+            amount=amount,
+            misc_fees=Decimal("0"),
+            commissions=Decimal("0"),
+        )
+        self.db.add(cash_event)
+
+        # Update trade totals
+        trade.close_amount += amount
+        trade.close_time = now
+
+        # Update qty
+        trade.qty -= qty
+
+        # Check if fully closed
+        if trade.qty <= 0:
+            trade.is_closed = True
+            trade.qty = 0
+            # Calculate P&L
+            trade.realized_pnl = trade.open_amount + trade.close_amount
+            trade.realized_pnl_net = trade.realized_pnl - trade.total_fees
+            action = "closed"
+            message = f"Closed {trade.underlying} position"
+        else:
+            # Partial close - calculate partial P&L
+            # Pro-rate the open amount for closed portion
+            open_per_contract = trade.open_amount / open_qty
+            partial_open = open_per_contract * qty
+            partial_pnl = partial_open + amount
+            trade.realized_pnl += partial_pnl
+            trade.realized_pnl_net = trade.realized_pnl - trade.total_fees
+            action = "partial_close"
+            message = f"Closed {qty}x of {open_qty}x {trade.underlying} (remaining: {trade.qty}x)"
+
+        self.db.commit()
+
+        return {
+            "trade_id": trade.id,
+            "action": action,
+            "message": message,
+        }
+
+    def _create_new_trade(self, parsed: dict, amount: Decimal, now, owner_key: str) -> dict:
+        """Create a brand new trade."""
+        qty = parsed["qty"]
+
+        # Map strategy label to strategy type
+        strategy_map = {
+            "SINGLE": f"SINGLE_{parsed['option_type'].value}",
+            "VERTICAL": f"VERTICAL_{parsed['option_type'].value}",
+            "BUTTERFLY": f"BUTTERFLY_{parsed['option_type'].value}",
+            "IRON_CONDOR": "IRON_CONDOR",
+            "IRON_BUTTERFLY": "IRON_BUTTERFLY",
+            "CALENDAR": "CALENDAR",
+            "DIAGONAL": "DIAGONAL",
+            "STRADDLE": "STRADDLE",
+            "STRANGLE": "STRANGLE",
+            "BACKRATIO": f"BACKRATIO_{parsed['option_type'].value}",
+        }
+        strategy = strategy_map.get(parsed["strategy_label"], "UNKNOWN")
+
+        # Create trade
+        trade = Trade(
+            id=str(uuid4()),
+            owner_key=owner_key,
+            underlying=parsed["underlying"],
+            strategy=strategy,
+            spread_label=parsed["strategy_label"],
+            open_direction=parsed["direction"].value,
+            strikes=[Decimal(str(s)) for s in parsed["strikes"]],
+            option_type=parsed["option_type"].value,
+            qty=qty,
+            open_time=now,
+            expiration=parsed["expiration"],
+            is_closed=False,
+            is_expired=False,
+            open_amount=amount,
+            close_amount=Decimal("0"),
+            total_fees=Decimal("0"),
+            realized_pnl=Decimal("0"),
+            realized_pnl_net=Decimal("0"),
+            dte_at_entry=self._calculate_dte(now.date(), parsed["expiration"]),
+        )
+        self.db.add(trade)
+
+        # Create cash event for the open
+        cash_event = CashEvent(
+            id=str(uuid4()),
+            trade_id=trade.id,
+            owner_key=owner_key,
+            ref=f"QUICK_ADD_{now.strftime('%Y%m%d%H%M%S')}",
+            event_date=now.date(),
+            event_time=now.strftime("%H:%M:%S"),
+            event_type="OPEN",
+            description=f"Quick add: {parsed['direction'].value} {qty}x {parsed['underlying']} {parsed['strategy_label']}",
+            direction=parsed["direction"].value,
+            qty=qty,
+            strategy_label=parsed["strategy_label"],
+            expiration=parsed["expiration"],
+            strikes=[Decimal(str(s)) for s in parsed["strikes"]],
+            option_type=parsed["option_type"].value,
+            net_price=Decimal(str(parsed["net_price"])),
+            amount=amount,
+            misc_fees=Decimal("0"),
+            commissions=Decimal("0"),
+        )
+        self.db.add(cash_event)
+
+        self.db.commit()
+
+        return {
+            "trade_id": trade.id,
+            "action": "created",
+            "message": f"Created {parsed['direction'].value} {qty}x {parsed['underlying']} {parsed['strategy_label']}",
+        }
 
     def list_trades(
         self,
@@ -340,6 +629,33 @@ class TradeService:
             return False
 
         trade.notes = notes
+        self.db.commit()
+        return True
+
+    def delete_trade(self, owner_key: str, trade_id: str) -> bool:
+        """Delete a trade and its associated cash events and legs."""
+        trade = self.db.execute(
+            select(Trade).where(
+                Trade.owner_key == owner_key,
+                Trade.id == trade_id,
+            )
+        ).scalar_one_or_none()
+
+        if not trade:
+            return False
+
+        # Delete associated cash events (cascade should handle this, but be explicit)
+        self.db.execute(
+            CashEvent.__table__.delete().where(CashEvent.trade_id == trade_id)
+        )
+
+        # Delete associated trade legs
+        self.db.execute(
+            TradeLeg.__table__.delete().where(TradeLeg.trade_id == trade_id)
+        )
+
+        # Delete the trade
+        self.db.delete(trade)
         self.db.commit()
         return True
 

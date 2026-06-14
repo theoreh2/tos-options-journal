@@ -65,6 +65,7 @@ class EventType(str, Enum):
     CLOSE = "CLOSE"
     EXPIRATION = "EXPIRATION"
     ASSIGNMENT = "ASSIGNMENT"
+    STOCK_DELIVERY = "STOCK_DELIVERY"     # stock received/delivered from assignment
     UNMATCHED_CLOSE = "UNMATCHED_CLOSE"   # position opened before export window
 
 class StrategyType(str, Enum):
@@ -243,6 +244,101 @@ _TRD_RE = re.compile(
     re.IGNORECASE,
 )
 
+# DIAGONAL/CALENDAR with two expirations (roll): "21 JAN 28/24 APR 26"
+_TRD_ROLL_RE = re.compile(
+    r"^(?P<dir>SOLD|BOT)\s+"
+    r"(?P<signed_qty>[+-]\d+)\s+"
+    r"(?P<strat>CALENDAR|DIAGONAL)\s+"
+    r"(?P<sym>[A-Z]+)\s+"
+    r"100\s+"
+    r"(?:\(Weeklys\)\s+)?"
+    r"(?P<exp_far>\d{1,2}\s+[A-Z]{3}\s+\d{2})/"
+    r"(?P<exp_near>\d{1,2}\s+[A-Z]{3}\s+\d{2})\s+"
+    r"(?P<strikes>[\d./]+)\s+"
+    r"(?P<otype>CALL|PUT)\s+"
+    r"@(?P<price>-?[\d.]+)",
+    re.IGNORECASE,
+)
+
+# ---------------------------------------------------------------------------
+# Order confirmation format parser (for quick-add)
+# ---------------------------------------------------------------------------
+# Examples:
+#   "BUY +2 VERTICAL SNOW 100 (Weeklys) 29 MAY 26 260/262.5 CALL @.05 LMT GTC"
+#   "(Replacing #1006409450039) BUY +1 VERTICAL SNOW 100 (Weeklys) 22 MAY 26 175/180 CALL @2.08 LMT"
+#   "BUY +1 CRM 100 17 JUL 26 150 PUT @1.29 LMT GTC"
+#   "BUY +1 BUTTERFLY SMH 100 (Weeklys) 29 MAY 26 550/530/510 PUT @.32 LMT"
+#   "BUY +1 1/2 BACKRATIO NFLX 100 (Weeklys) 24 APR 26 89/86 PUT @.23 LMT GTC"
+#   "SELL -1 DIAGONAL NKE 100 21 JAN 28/24 APR 26 45/52 PUT @.85 LMT"
+
+_ORDER_RE = re.compile(
+    r"(?:\(Replacing[^)]+\)\s*)?"  # Optional replacing prefix
+    r"(?P<dir>BUY|SELL)\s+"
+    r"(?P<signed_qty>[+-]\d+)\s+"
+    r"(?:(?P<ratio>\d+/\d+)\s+)?"  # Optional ratio like "1/2"
+    r"(?:(?P<strat>VERTICAL|BUTTERFLY|IRON\s+CONDOR|IRON\s+BUTTERFLY|"
+    r"CALENDAR|DIAGONAL|STRANGLE|STRADDLE|BACKRATIO)\s+)?"
+    r"(?P<sym>[A-Z]+)\s+"
+    r"100\s+"
+    r"(?:\(Weeklys\)\s+)?"
+    r"(?P<exp>[\d]{1,2}\s+[A-Z]{3}\s+\d{2}(?:/[\d]{1,2}\s+[A-Z]{3}\s+\d{2})?)\s+"  # Single or dual exp
+    r"(?P<strikes>[\d./]+)\s+"
+    r"(?P<otype>CALL|PUT)\s+"
+    r"@(?P<price>-?[\d.]+)",
+    re.IGNORECASE,
+)
+
+
+def parse_order_confirmation(text: str) -> Optional[dict]:
+    """
+    Parse an order confirmation line into trade details.
+
+    Returns dict with:
+        direction, qty, strategy_label, underlying, expiration,
+        strikes, option_type, net_price
+    Or None if parsing fails.
+    """
+    text = text.strip()
+    m = _ORDER_RE.match(text)
+    if not m:
+        return None
+
+    # Parse expiration (may be single or dual for DIAGONAL/CALENDAR)
+    exp_str = m.group("exp")
+    if "/" in exp_str and m.group("strat") and m.group("strat").upper() in ("DIAGONAL", "CALENDAR"):
+        # Dual expiration - use the far (first) one as the trade expiration
+        exp_parts = exp_str.split("/")
+        expiration = _parse_exp_words(exp_parts[0].strip())
+    else:
+        expiration = _parse_exp_words(exp_str)
+
+    # Parse strikes
+    strikes_str = m.group("strikes")
+    strikes = [float(s) for s in strikes_str.split("/") if s]
+
+    # Strategy label
+    strat = m.group("strat")
+    if strat:
+        strat = strat.strip().upper().replace(" ", "_")
+    else:
+        strat = "SINGLE"
+
+    # Handle BACKRATIO - treat as the base strategy type
+    if strat == "BACKRATIO":
+        strat = "BACKRATIO"
+
+    return {
+        "direction": Side.SELL if m.group("dir").upper() == "SELL" else Side.BUY,
+        "qty": abs(int(m.group("signed_qty"))),
+        "strategy_label": strat,
+        "underlying": m.group("sym").upper(),
+        "expiration": expiration,
+        "strikes": strikes,
+        "option_type": OptionType.CALL if m.group("otype").upper() == "CALL" else OptionType.PUT,
+        "net_price": float(m.group("price")),
+        "ratio": m.group("ratio"),  # For back ratios like "1/2"
+    }
+
 _RAD_RE = re.compile(
     r"Removed due to (?P<reason>Expiration|Assignment)\s+"
     r"(?P<otype>CALL|PUT)\s+"
@@ -252,6 +348,17 @@ _RAD_RE = re.compile(
 )
 
 _RAD_SYM_RE = re.compile(r"\.?([A-Z]+)\d{6}[CP][\d.]+$")
+
+# EXP: Stock delivery from assignment/exercise
+# "BOT 200.0 SNOW UPON SNOWFLAKE INC CLASS CLASS A"
+# "SOLD -100.0 AAPL UPON APPLE INC"
+_EXP_RE = re.compile(
+    r"^(?P<dir>SOLD|BOT)\s+"
+    r"(?P<qty>-?[\d.]+)\s+"
+    r"(?P<sym>[A-Z]+)\s+"
+    r"UPON\s+",
+    re.IGNORECASE,
+)
 
 
 def _parse_trd(desc: str) -> Optional[dict]:
@@ -269,6 +376,82 @@ def _parse_trd(desc: str) -> Optional[dict]:
         "strikes": strikes,
         "option_type": OptionType.CALL if m.group("otype").upper() == "CALL" else OptionType.PUT,
         "net_price": float(m.group("price")),
+    }
+
+
+def _parse_roll(desc: str) -> Optional[dict]:
+    """
+    Parse a DIAGONAL/CALENDAR roll with two expirations.
+
+    Example: "SOLD -1 DIAGONAL NKE 100 21 JAN 28/24 APR 26 45/52 PUT @.85"
+    - exp_far = 21 JAN 28 (the new/far leg being opened)
+    - exp_near = 24 APR 26 (the old/near leg being closed)
+    - strikes = 45/52 (far strike / near strike)
+
+    SOLD DIAGONAL = close near leg (buy back), open far leg (sell)
+    BOT DIAGONAL = close near leg (sell), open far leg (buy)
+
+    Returns dict with 'close_leg' and 'open_leg' sub-dicts.
+    """
+    m = _TRD_ROLL_RE.match(desc.strip())
+    if not m:
+        return None
+
+    strikes = [float(s) for s in m.group("strikes").split("/") if s]
+    strike_far = strikes[0] if len(strikes) >= 1 else None
+    strike_near = strikes[1] if len(strikes) >= 2 else strikes[0] if strikes else None
+
+    direction = Side.SELL if m.group("dir").upper() == "SOLD" else Side.BUY
+    qty = abs(int(m.group("signed_qty")))
+    option_type = OptionType.CALL if m.group("otype").upper() == "CALL" else OptionType.PUT
+
+    # SOLD DIAGONAL: you're selling the spread
+    #   - Close near leg by buying it back (BUY)
+    #   - Open far leg by selling it (SELL)
+    # BOT DIAGONAL: you're buying the spread
+    #   - Close near leg by selling it (SELL)
+    #   - Open far leg by buying it (BUY)
+
+    if direction == Side.SELL:
+        close_dir = Side.BUY
+        open_dir = Side.SELL
+    else:
+        close_dir = Side.SELL
+        open_dir = Side.BUY
+
+    return {
+        "is_roll": True,
+        "underlying": m.group("sym").upper(),
+        "qty": qty,
+        "option_type": option_type,
+        "net_price": float(m.group("price")),
+        "close_leg": {
+            "direction": close_dir,
+            "expiration": _parse_exp_words(m.group("exp_near")),
+            "strike": strike_near,
+        },
+        "open_leg": {
+            "direction": open_dir,
+            "expiration": _parse_exp_words(m.group("exp_far")),
+            "strike": strike_far,
+        },
+    }
+
+
+def _parse_exp(desc: str) -> Optional[dict]:
+    """
+    Parse EXP (stock exercise/assignment delivery) line.
+
+    Example: "BOT 200.0 SNOW UPON SNOWFLAKE INC CLASS CLASS A"
+    This means you received 200 shares of SNOW due to put assignment.
+    """
+    m = _EXP_RE.match(desc.strip())
+    if not m:
+        return None
+    return {
+        "direction": Side.SELL if m.group("dir").upper() == "SOLD" else Side.BUY,
+        "qty": abs(int(float(m.group("qty")))),
+        "underlying": m.group("sym").upper(),
     }
 
 
@@ -294,8 +477,14 @@ def _parse_rad(desc: str) -> Optional[dict]:
 
 class PositionTracker:
     """
-    Tracks open positions per underlying.
-    Each position is a tuple: (direction: Side, strikes: set, expiration, option_type, trade)
+    Tracks open positions per underlying with quantity tracking.
+
+    Key behaviors:
+    - Tracks open_qty for each position
+    - Same-direction events ADD to existing position (scale-in)
+    - Opposite-direction events CLOSE position (full or partial)
+    - Position removed when open_qty reaches 0
+
     direction = SELL means net short (credit spread opened with SOLD)
                 BUY  means net long (debit spread opened with BOT)
     """
@@ -304,22 +493,38 @@ class PositionTracker:
         # underlying -> list of open position dicts
         self._positions: dict[str, list[dict]] = {}
 
-    def find_open(self, event: CashEvent) -> Optional[Trade]:
-        """Find an open trade that this event would close."""
+    def find_matching_position(self, event: CashEvent) -> Optional[dict]:
+        """Find a position matching this event's contract specs."""
+        for pos in self._positions.get(event.underlying, []):
+            if self._contracts_match(pos, event):
+                return pos
+        return None
+
+    def find_for_close(self, event: CashEvent) -> Optional[dict]:
+        """Find an open position that this event would close (opposite direction)."""
         for pos in self._positions.get(event.underlying, []):
             if not self._contracts_match(pos, event):
                 continue
-            # A close reverses the direction:
-            # If open was SELL (short), close is BUY
-            # If open was BUY (long), close is SELL
+            # A close reverses the direction
             open_dir = pos["direction"]
             if open_dir == Side.SELL and event.direction == Side.BUY:
-                return pos["trade"]
+                return pos
             if open_dir == Side.BUY and event.direction == Side.SELL:
-                return pos["trade"]
+                return pos
         return None
 
-    def add_open(self, event: CashEvent, trade: Trade) -> None:
+    def find_for_add(self, event: CashEvent) -> Optional[dict]:
+        """Find an open position to add to (same direction = scale-in)."""
+        for pos in self._positions.get(event.underlying, []):
+            if not self._contracts_match(pos, event):
+                continue
+            # Same direction = adding to position
+            if pos["direction"] == event.direction:
+                return pos
+        return None
+
+    def add_position(self, event: CashEvent, trade: Trade) -> None:
+        """Create a new open position."""
         if event.underlying not in self._positions:
             self._positions[event.underlying] = []
         self._positions[event.underlying].append({
@@ -327,15 +532,34 @@ class PositionTracker:
             "strikes": set(event.strikes),
             "expiration": event.expiration,
             "option_type": event.option_type,
+            "open_qty": event.qty,
             "trade": trade,
         })
 
-    def remove(self, trade: Trade) -> None:
+    def add_to_position(self, pos: dict, event: CashEvent) -> None:
+        """Add quantity to existing position (scale-in)."""
+        pos["open_qty"] += event.qty
+
+    def reduce_position(self, pos: dict, qty: int) -> bool:
+        """Reduce position quantity. Returns True if fully closed."""
+        pos["open_qty"] -= qty
+        if pos["open_qty"] <= 0:
+            self._remove_position(pos)
+            return True
+        return False
+
+    def _remove_position(self, pos: dict) -> None:
+        """Remove a position from tracking."""
+        for sym, positions in self._positions.items():
+            self._positions[sym] = [p for p in positions if p is not pos]
+
+    def remove_trade(self, trade: Trade) -> None:
+        """Remove all positions for a trade."""
         for sym, positions in self._positions.items():
             self._positions[sym] = [p for p in positions if p["trade"] is not trade]
 
-    def find_for_expiration(self, event: CashEvent) -> Optional[Trade]:
-        """Match RAD event to open trade. Strike nearest match within open strikes."""
+    def find_for_expiration(self, event: CashEvent) -> Optional[dict]:
+        """Match RAD event to open position. Strike nearest match within open strikes."""
         for pos in self._positions.get(event.underlying, []):
             if pos["expiration"] != event.expiration:
                 continue
@@ -343,12 +567,12 @@ class PositionTracker:
                 continue
             # Any of the event's strikes overlap with open strikes
             if event.strikes and pos["strikes"] & set(event.strikes):
-                return pos["trade"]
+                return pos
             # Fallback: strike within $0.01
             if event.strikes:
                 for open_strike in pos["strikes"]:
                     if abs(open_strike - event.strikes[0]) < 0.01:
-                        return pos["trade"]
+                        return pos
         return None
 
     def _contracts_match(self, pos: dict, event: CashEvent) -> bool:
@@ -369,6 +593,15 @@ class PositionTracker:
                     seen.add(id(t))
                     result.append(t)
         return result
+
+    def get_open_qty(self, trade: Trade) -> int:
+        """Get total open quantity for a trade."""
+        total = 0
+        for positions in self._positions.values():
+            for p in positions:
+                if p["trade"] is trade:
+                    total += p["open_qty"]
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +661,7 @@ class TOSParser:
             if len(row) < 3:
                 continue
             type_ = row[2].strip()
-            if type_ not in ("TRD", "RAD"):
+            if type_ not in ("TRD", "RAD", "EXP"):
                 continue
 
             date_str = row[0].strip() if row else ""
@@ -448,6 +681,47 @@ class TOSParser:
                     pass
 
             if type_ == "TRD":
+                # Try to parse as a DIAGONAL/CALENDAR roll first
+                roll = _parse_roll(desc)
+                if roll:
+                    # Roll = two events: close near leg + open far leg
+                    # For P&L: attribute all amount/fees to the close leg
+                    close_event = CashEvent(
+                        ref=f"{ref}_CLOSE", date=parsed_date, time_str=time_str,
+                        event_type=EventType.CLOSE,
+                        description=f"[ROLL CLOSE] {desc}",
+                        direction=roll["close_leg"]["direction"],
+                        qty=roll["qty"],
+                        strategy_label="SINGLE",
+                        underlying=roll["underlying"],
+                        expiration=roll["close_leg"]["expiration"],
+                        strikes=[roll["close_leg"]["strike"]] if roll["close_leg"]["strike"] else [],
+                        option_type=roll["option_type"],
+                        net_price=roll["net_price"],
+                        amount=amt, misc_fees=misc, commissions=comm,
+                    )
+                    open_event = CashEvent(
+                        ref=f"{ref}_OPEN", date=parsed_date, time_str=time_str,
+                        event_type=EventType.OPEN,
+                        description=f"[ROLL OPEN] {desc}",
+                        direction=roll["open_leg"]["direction"],
+                        qty=roll["qty"],
+                        strategy_label="SINGLE",
+                        underlying=roll["underlying"],
+                        expiration=roll["open_leg"]["expiration"],
+                        strikes=[roll["open_leg"]["strike"]] if roll["open_leg"]["strike"] else [],
+                        option_type=roll["option_type"],
+                        net_price=0.0,  # Price already in close leg
+                        amount=0.0, misc_fees=0.0, commissions=0.0,
+                    )
+                    events.append(close_event)
+                    events.append(open_event)
+                    logger.info("Parsed roll: %s -> close %s, open %s",
+                                roll["underlying"],
+                                roll["close_leg"]["expiration"],
+                                roll["open_leg"]["expiration"])
+                    continue
+
                 parsed = _parse_trd(desc)
                 if not parsed:
                     logger.warning("Could not parse TRD description: %s", desc)
@@ -479,7 +753,7 @@ class TOSParser:
                 ref_accum[ref] = event
                 events.append(event)
 
-            else:  # RAD
+            elif type_ == "RAD":
                 parsed = _parse_rad(desc)
                 if not parsed:
                     logger.warning("Could not parse RAD description: %s", desc)
@@ -498,6 +772,25 @@ class TOSParser:
                     amount=0.0, misc_fees=0.0, commissions=0.0,
                 )
                 events.append(event)
+
+            elif type_ == "EXP":
+                # Stock delivery from assignment/exercise
+                parsed = _parse_exp(desc)
+                if not parsed:
+                    logger.warning("Could not parse EXP description: %s", desc)
+                    continue
+                event = CashEvent(
+                    ref=ref, date=parsed_date, time_str=time_str,
+                    event_type=EventType.STOCK_DELIVERY,
+                    description=desc,
+                    direction=parsed["direction"],
+                    underlying=parsed["underlying"],
+                    qty=parsed["qty"],
+                    amount=amt, misc_fees=misc, commissions=comm,
+                )
+                events.append(event)
+                logger.info("Parsed stock delivery: %s %s %d shares",
+                            parsed["direction"], parsed["underlying"], parsed["qty"])
 
         logger.info("Parsed %d cash events", len(events))
         return events
@@ -622,7 +915,14 @@ class TOSParser:
         events: list[CashEvent],
         history: dict[str, list[TradeLeg]],
     ) -> list[Trade]:
+        """
+        Build trades from cash events with proper quantity tracking.
 
+        Logic:
+        - Same direction as existing position = scale-in (add to position)
+        - Opposite direction = close (full or partial based on qty)
+        - RAD events close positions on expiration/assignment
+        """
         tracker = PositionTracker()
         all_trades: list[Trade] = []
 
@@ -630,19 +930,40 @@ class TOSParser:
             if not event.underlying:
                 continue
 
+            # ── STOCK_DELIVERY: from assignment/exercise ────────────────
+            if event.event_type == EventType.STOCK_DELIVERY:
+                # Find the most recent trade for this underlying that was assigned
+                # and attach the stock delivery event to it
+                for trade in reversed(all_trades):
+                    if trade.underlying == event.underlying:
+                        # Check if this trade has an assignment event
+                        has_assignment = any(
+                            e.event_type == EventType.ASSIGNMENT
+                            for e in trade.close_events
+                        )
+                        if has_assignment:
+                            trade.close_events.append(event)
+                            trade.recalculate()
+                            logger.info("Attached stock delivery to %s trade", event.underlying)
+                            break
+                else:
+                    logger.warning(
+                        "STOCK_DELIVERY %s — no assigned trade found",
+                        event.underlying
+                    )
+                continue
+
             # ── RAD: expiration or assignment ──────────────────────────
             if event.event_type in (EventType.EXPIRATION, EventType.ASSIGNMENT):
-                trade = tracker.find_for_expiration(event)
-                if trade:
+                pos = tracker.find_for_expiration(event)
+                if pos:
+                    trade = pos["trade"]
                     trade.close_events.append(event)
-                    # Only mark closed once all legs accounted for
-                    # (multi-leg expirations have one RAD per leg)
-                    # We close after first match and trust recalculate()
-                    if not trade.is_closed:
-                        trade.is_expired = (event.event_type == EventType.EXPIRATION)
-                        trade.is_closed = True
-                        trade.close_time = event.exec_datetime
-                        tracker.remove(trade)
+                    # RAD typically closes entire position
+                    trade.is_expired = (event.event_type == EventType.EXPIRATION)
+                    trade.is_closed = True
+                    trade.close_time = event.exec_datetime
+                    tracker.remove_trade(trade)
                     trade.recalculate()
                 else:
                     logger.warning(
@@ -651,30 +972,61 @@ class TOSParser:
                     )
                 continue
 
-            # ── TRD: open or close ─────────────────────────────────────
-            open_trade = tracker.find_open(event)
+            # ── TRD: check if this closes or adds to existing position ──
+            close_pos = tracker.find_for_close(event)
 
-            if open_trade:
-                # This event closes the open trade
+            if close_pos:
+                # Opposite direction = closing (full or partial)
                 event.event_type = EventType.CLOSE
-                open_trade.close_events.append(event)
-                open_trade.close_time = event.exec_datetime
-                open_trade.is_closed = True
-                open_trade.recalculate()
-                tracker.remove(open_trade)
-            else:
-                # New open position
-                event.event_type = EventType.OPEN
-                trade = Trade(
-                    underlying=event.underlying,
-                    spread_label=event.strategy_label,
-                    expiration=event.expiration,
-                    open_time=event.exec_datetime,
-                )
-                trade.open_events.append(event)
+                trade = close_pos["trade"]
+                trade.close_events.append(event)
+                trade.close_time = event.exec_datetime
+
+                # Reduce position quantity
+                fully_closed = tracker.reduce_position(close_pos, event.qty)
+                if fully_closed:
+                    trade.is_closed = True
                 trade.recalculate()
-                tracker.add_open(event, trade)
-                all_trades.append(trade)
+                continue
+
+            # Check if this adds to existing position (same direction = scale-in)
+            add_pos = tracker.find_for_add(event)
+
+            if add_pos:
+                # Same direction = adding to position (scale-in)
+                event.event_type = EventType.OPEN
+                trade = add_pos["trade"]
+                trade.open_events.append(event)
+                tracker.add_to_position(add_pos, event)
+                trade.recalculate()
+                continue
+
+            # No existing position - create new trade
+            event.event_type = EventType.OPEN
+            trade = Trade(
+                underlying=event.underlying,
+                spread_label=event.strategy_label,
+                expiration=event.expiration,
+                open_time=event.exec_datetime,
+            )
+            trade.open_events.append(event)
+            trade.recalculate()
+            tracker.add_position(event, trade)
+            all_trades.append(trade)
+
+        # Auto-close trades that have expired (no RAD event but past expiration)
+        today = date.today()
+        for trade in all_trades:
+            if not trade.is_closed and trade.expiration and trade.expiration < today:
+                trade.is_closed = True
+                trade.is_expired = True
+                # Set close_time to expiration date at market close
+                trade.close_time = datetime.combine(trade.expiration, datetime.strptime("16:00:00", "%H:%M:%S").time())
+                trade.recalculate()
+                logger.info(
+                    "Auto-closed expired trade: %s %s exp %s (no RAD event)",
+                    trade.underlying, trade.strategy, trade.expiration
+                )
 
         # Attach legs + classify
         self._attach_legs(all_trades, history)

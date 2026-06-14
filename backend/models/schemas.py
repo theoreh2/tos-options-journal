@@ -54,6 +54,10 @@ class TradeListItem(BaseModel):
     underlying: str
     strategy: str
     spread_label: Optional[str]
+    open_direction: Optional[str]
+    strikes: Optional[list[Decimal]]
+    option_type: Optional[str]
+    qty: int
     open_time: datetime
     close_time: Optional[datetime]
     expiration: Optional[date]

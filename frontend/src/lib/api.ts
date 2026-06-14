@@ -30,6 +30,10 @@ export interface Trade {
   underlying: string
   strategy: string
   spread_label: string | null
+  open_direction: string | null
+  strikes: number[] | null
+  option_type: string | null
+  qty: number
   open_time: string
   close_time: string | null
   expiration: string | null
@@ -163,5 +167,47 @@ export async function fetchAnalyticsByUnderlying(): Promise<UnderlyingBreakdown[
 export async function fetchPnLOverTime(): Promise<PnLOverTimePoint[]> {
   const res = await authFetch(`${API_URL}/api/analytics/over-time`)
   if (!res.ok) throw new Error('Failed to fetch P&L over time')
+  return res.json()
+}
+
+export interface QuickAddResponse {
+  success: boolean
+  trade_id: string | null
+  message: string
+  parsed: {
+    direction: string
+    qty: number
+    underlying: string
+    strategy_label: string
+    strikes: number[]
+    option_type: string
+    expiration: string | null
+    net_price: number
+  } | null
+}
+
+export async function quickAddTrade(text: string): Promise<QuickAddResponse> {
+  const res = await authFetch(`${API_URL}/api/trades/quick-add`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+  })
+  if (!res.ok) {
+    const error = await res.json()
+    throw new Error(error.detail || 'Quick add failed')
+  }
+  return res.json()
+}
+
+export async function deleteTrade(tradeId: string): Promise<{ id: string; deleted: boolean }> {
+  const res = await authFetch(`${API_URL}/api/trades/${tradeId}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    const error = await res.json()
+    throw new Error(error.detail || 'Delete failed')
+  }
   return res.json()
 }

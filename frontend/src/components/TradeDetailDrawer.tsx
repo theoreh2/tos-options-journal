@@ -7,6 +7,7 @@ interface TradeDetailDrawerProps {
   trade: Trade | null
   onClose: () => void
   onNotesUpdate?: (tradeId: string, notes: string) => void
+  onDelete?: (tradeId: string) => void
 }
 
 interface TradeDetail extends Trade {
@@ -37,11 +38,13 @@ interface TradeDetail extends Trade {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-export function TradeDetailDrawer({ trade, onClose, onNotesUpdate }: TradeDetailDrawerProps) {
+export function TradeDetailDrawer({ trade, onClose, onNotesUpdate, onDelete }: TradeDetailDrawerProps) {
   const [detail, setDetail] = useState<TradeDetail | null>(null)
   const [loading, setLoading] = useState(false)
   const [notes, setNotes] = useState('')
   const [savingNotes, setSavingNotes] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [confirmDelete, setConfirmDelete] = useState(false)
 
   useEffect(() => {
     if (!trade) {
@@ -86,6 +89,25 @@ export function TradeDetailDrawer({ trade, onClose, onNotesUpdate }: TradeDetail
     }
   }
 
+  const handleDelete = async () => {
+    if (!trade) return
+    setDeleting(true)
+    try {
+      const res = await fetch(`${API_URL}/api/trades/${trade.id}`, {
+        method: 'DELETE',
+      })
+      if (res.ok) {
+        onDelete?.(trade.id)
+        onClose()
+      }
+    } catch (err) {
+      console.error('Failed to delete trade', err)
+    } finally {
+      setDeleting(false)
+      setConfirmDelete(false)
+    }
+  }
+
   if (!trade) return null
 
   const formatCurrency = (value: number) => {
@@ -96,7 +118,11 @@ export function TradeDetailDrawer({ trade, onClose, onNotesUpdate }: TradeDetail
   }
 
   const formatDate = (dateStr: string) => {
-    return new Date(dateStr).toLocaleDateString('en-US', {
+    // Parse date string without timezone conversion
+    // dateStr is "YYYY-MM-DD" - parse parts directly to avoid UTC shift
+    const [year, month, day] = dateStr.split('-').map(Number)
+    const date = new Date(year, month - 1, day) // month is 0-indexed
+    return date.toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
       year: 'numeric',
@@ -265,6 +291,41 @@ export function TradeDetailDrawer({ trade, onClose, onNotesUpdate }: TradeDetail
               >
                 {savingNotes ? 'Saving...' : 'Save Notes'}
               </button>
+            </div>
+
+            {/* Delete Trade */}
+            <div className="border-t border-zinc-200 pt-6 dark:border-zinc-800">
+              <h3 className="mb-2 text-sm font-medium text-red-600">Danger Zone</h3>
+              {confirmDelete ? (
+                <div className="rounded-lg border border-red-200 bg-red-50 p-4 dark:border-red-800 dark:bg-red-950">
+                  <p className="mb-3 text-sm text-red-700 dark:text-red-400">
+                    Are you sure you want to delete this trade? This action cannot be undone.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleDelete}
+                      disabled={deleting}
+                      className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                    >
+                      {deleting ? 'Deleting...' : 'Yes, Delete'}
+                    </button>
+                    <button
+                      onClick={() => setConfirmDelete(false)}
+                      disabled={deleting}
+                      className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  className="rounded-md border border-red-300 bg-white px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-900 dark:hover:bg-red-950"
+                >
+                  Delete Trade
+                </button>
+              )}
             </div>
           </div>
         )}

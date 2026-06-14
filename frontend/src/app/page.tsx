@@ -5,30 +5,35 @@ import Link from 'next/link'
 import { NavHeader } from '@/components/NavHeader'
 import { PnLCard } from '@/components/PnLCard'
 import { TradeTable } from '@/components/TradeTable'
+import { QuickAddTrade } from '@/components/QuickAddTrade'
 import { fetchAnalyticsSummary, fetchTrades, type AnalyticsSummary, type Trade } from '@/lib/api'
 
 export default function Dashboard() {
   const [summary, setSummary] = useState<AnalyticsSummary | null>(null)
-  const [recentTrades, setRecentTrades] = useState<Trade[]>([])
+  const [openTrades, setOpenTrades] = useState<Trade[]>([])
+  const [recentClosed, setRecentClosed] = useState<Trade[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    async function loadData() {
-      try {
-        const [summaryData, tradesData] = await Promise.all([
-          fetchAnalyticsSummary(),
-          fetchTrades({ page_size: 20 }),
-        ])
-        setSummary(summaryData)
-        setRecentTrades(tradesData.trades)
-      } catch (err) {
-        setError('Failed to load dashboard data. Is the backend running?')
-        console.error(err)
-      } finally {
-        setLoading(false)
-      }
+  const loadData = async () => {
+    try {
+      const [summaryData, openData, closedData] = await Promise.all([
+        fetchAnalyticsSummary(),
+        fetchTrades({ status: 'open', page_size: 50 }),
+        fetchTrades({ status: 'closed', page_size: 5 }),
+      ])
+      setSummary(summaryData)
+      setOpenTrades(openData.trades)
+      setRecentClosed(closedData.trades)
+    } catch (err) {
+      setError('Failed to load dashboard data. Is the backend running?')
+      console.error(err)
+    } finally {
+      setLoading(false)
     }
+  }
+
+  useEffect(() => {
     loadData()
   }, [])
 
@@ -79,14 +84,19 @@ export default function Dashboard() {
               />
             </div>
 
+            {/* Quick Add Trade */}
+            <section className="mb-8">
+              <QuickAddTrade onTradeAdded={loadData} />
+            </section>
+
             {/* Open Positions */}
             <section className="mb-8">
               <div className="mb-4 flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
-                  Open Positions ({summary?.open_trades ?? 0})
+                  Open Positions ({openTrades.length})
                 </h2>
               </div>
-              <TradeTable trades={recentTrades.filter((t) => !t.is_closed)} />
+              <TradeTable trades={openTrades} showDteRemaining />
             </section>
 
             {/* Recent Closed Trades */}
@@ -102,7 +112,7 @@ export default function Dashboard() {
                   View all
                 </Link>
               </div>
-              <TradeTable trades={recentTrades.filter((t) => t.is_closed).slice(0, 5)} />
+              <TradeTable trades={recentClosed} />
             </section>
           </>
         )}

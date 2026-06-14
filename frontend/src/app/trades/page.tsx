@@ -42,30 +42,37 @@ export default function TradesPage() {
     loadStrategies()
   }, [])
 
-  useEffect(() => {
-    async function loadTrades() {
-      setLoading(true)
-      try {
-        const data = await fetchTrades({
-          underlying: underlying || undefined,
-          strategy: strategy || undefined,
-          status: status || undefined,
-          date_from: dateFrom || undefined,
-          date_to: dateTo || undefined,
-          page,
-          page_size: pageSize,
-        })
-        setTrades(data.trades)
-        setTotal(data.total)
-      } catch (err) {
-        setError('Failed to load trades')
-        console.error(err)
-      } finally {
-        setLoading(false)
-      }
+  const loadTrades = async () => {
+    setLoading(true)
+    try {
+      const data = await fetchTrades({
+        underlying: underlying || undefined,
+        strategy: strategy || undefined,
+        status: status || undefined,
+        date_from: dateFrom || undefined,
+        date_to: dateTo || undefined,
+        page,
+        page_size: pageSize,
+      })
+      setTrades(data.trades)
+      setTotal(data.total)
+    } catch (err) {
+      setError('Failed to load trades')
+      console.error(err)
+    } finally {
+      setLoading(false)
     }
+  }
+
+  useEffect(() => {
     loadTrades()
   }, [underlying, strategy, status, dateFrom, dateTo, page])
+
+  const handleTradeDeleted = (tradeId: string) => {
+    // Remove from local state and refresh
+    setTrades(trades.filter(t => t.id !== tradeId))
+    setTotal(t => t - 1)
+  }
 
   const totalPages = Math.ceil(total / pageSize)
 
@@ -216,6 +223,7 @@ export default function TradesPage() {
       <TradeDetailDrawer
         trade={selectedTrade}
         onClose={() => setSelectedTrade(null)}
+        onDelete={handleTradeDeleted}
       />
     </div>
   )

@@ -191,6 +191,23 @@ class Trade(Base):
         String(50),
         comment="Raw TOS label (VERTICAL, BUTTERFLY, etc.)",
     )
+    open_direction: Mapped[Optional[str]] = mapped_column(
+        String(10),
+        comment="BUY or SELL at open",
+    )
+    strikes: Mapped[Optional[list[Decimal]]] = mapped_column(
+        ARRAY(Numeric(12, 2)),
+        comment="Array of strike prices",
+    )
+    option_type: Mapped[Optional[str]] = mapped_column(
+        String(10),
+        comment="CALL or PUT",
+    )
+    qty: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        comment="Current open quantity (contracts)",
+    )
     open_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     close_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     expiration: Mapped[Optional[date]] = mapped_column(Date)
